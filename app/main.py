@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from . import dicom, storage
+from .archive import ArchiveError, ArchiveService, ArchiveStateError
 from .config import settings
 from .db import (
     STATE_COMPLETED,
@@ -29,18 +30,20 @@ log = logging.getLogger("api")
 # 进程级单例（lifespan 中初始化）
 db: Database | None = None
 pipeline: Pipeline | None = None
+archive: ArchiveService | None = None
 _scp_server = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db, pipeline, _scp_server
+    global db, pipeline, archive, _scp_server
     settings.ensure_dirs()
     db = Database(settings.DB_PATH)
     set_db(db)
-    recover_on_startup(db)
+    archive = ArchiveService(db)
+    recover_on_startup(db, archive)
     _scp_server = dicom.start_store_scp(db)
-    pipeline = Pipeline(db)
+    pipeline = Pipeline(db, archive)
     log.info("API 就绪，数据卷=%s", settings.DATA_DIR)
     try:
         yield
@@ -53,13 +56,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DICOM CT 离线取数流水线",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "提交 StudyInstanceUID → C-FIND 固定 SOP 清单 → C-MOVE 回传 → "
         "C-STORE 接收非压缩 CT → 核对收齐后打包 ZIP 下载。\n\n"
         "规则：清单外实例不入包、重复实例不重复计数、保存失败即批失败、"
-        "失败批迟到回传不可恢复、重启后未完成批判失败。"
+        "失败批迟到回传不可恢复、重启后未完成批判失败。\n\n"
+        "归档恢复：重启及每次下载前核对 ZIP（条目可读 + 与已登记 SOP 清单一致），"
+        "损坏/丢失即从已登记原片单飞重建（并发只重建一次，临时包不可见，"
+        "原子替换不打断有效下载）；原片缺失或重建失败时保留完成记录、"
+        "标记不可下载及具体原因，修复数据卷后再次请求即可恢复。"
     ),
 )
 
@@ -84,10 +91,17 @@ class BatchView(BaseModel):
     received_count: int
     failure_reason: str | None
     zip_path: str | None
+    download_blocked_reason: str | None = Field(
+        None,
+        description="完成批暂不可下载的具体原因（原片缺失/重建写盘失败）；"
+        "修复数据卷后再次请求下载即可恢复",
+    )
     fault_inject: str
     created_at: str
     updated_at: str
-    downloadable: bool
+    downloadable: bool = Field(
+        ..., description="当前可下载：COMPLETED 且无未恢复的归档异常"
+    )
 
 
 def _view(row: dict) -> BatchView:
@@ -99,10 +113,14 @@ def _view(row: dict) -> BatchView:
         received_count=row["received_count"],
         failure_reason=row["failure_reason"],
         zip_path=row["zip_path"],
+        download_blocked_reason=row["download_blocked_reason"],
         fault_inject=row["fault_inject"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
-        downloadable=row["state"] == STATE_COMPLETED and bool(row["zip_path"]),
+        downloadable=(
+            row["state"] == STATE_COMPLETED
+            and not row["download_blocked_reason"]
+        ),
     )
 
 
@@ -166,19 +184,28 @@ def get_instances(batch_id: str) -> dict:
 
 
 @app.get("/batches/{batch_id}/download",
-         tags=["batches"], summary="下载 ZIP（仅 COMPLETED 批可下载）")
+         tags=["batches"],
+         summary="下载 ZIP（下载前核对归档，损坏/丢失自动从登记原片重建）",
+         responses={
+             200: {"content": {"application/zip": {}},
+                   "description": "核对通过（或已重建）的完整 ZIP"},
+             404: {"description": "批不存在"},
+             409: {"description": "批未到 COMPLETED，或归档不可用"
+                                  "（原片缺失/重建写盘失败，detail 含具体原因）"},
+         })
 def download_zip(batch_id: str) -> FileResponse:
     row = db.get_batch(batch_id)
     if row is None:
         raise HTTPException(404, "批不存在")
-    if row["state"] != STATE_COMPLETED or not row["zip_path"]:
-        raise HTTPException(
-            409,
-            f"批状态 {row['state']} 不可下载；仅 C-MOVE 成功且清单收齐的批可下载",
-        )
-    path = Path(row["zip_path"])
-    if not path.exists():
-        raise HTTPException(410, "ZIP 文件缺失（数据卷可能已损坏）")
+    try:
+        # 下载前核对：ZIP 条目可读且与已登记 SOP 清单一致；
+        # 异常时单飞重建；并发下载只重建一次，有效下载不被替换打断。
+        path = archive.ensure_package(batch_id, trigger="下载请求")
+    except ArchiveStateError as exc:
+        raise HTTPException(409, str(exc))
+    except ArchiveError as exc:
+        # 保留完成记录，但不可下载；绝不返回残缺 ZIP
+        raise HTTPException(409, f"归档暂不可下载：{exc}")
     return FileResponse(
         path, media_type="application/zip",
         filename=f"{batch_id}.zip",
@@ -243,3 +270,90 @@ def suicide(tasks: BackgroundTasks) -> dict:
         os._exit(1)
     tasks.add_task(_die)
     return {"detail": "进程即将退出，等待 Docker 重启"}
+
+
+# ------------------------------------------------------- 归档故障注入（演示）
+def _quarantine_dir(batch_id: str) -> Path:
+    return settings.DATA_DIR / "quarantine" / batch_id
+
+
+@app.post("/internal/fault/corrupt-zip/{batch_id}", tags=["internal"],
+          summary="（演示用）损坏/删除已完成批的 ZIP，模拟数据卷归档损坏")
+def fault_corrupt_zip(batch_id: str, mode: str = "corrupt") -> dict:
+    """``mode``: corrupt=中部位翻转（条目 CRC 损坏）、truncate=截断
+    （结构损坏）、missing=删除（归档丢失）。"""
+    if mode not in ("corrupt", "truncate", "missing"):
+        raise HTTPException(400, "mode 只支持 corrupt / truncate / missing")
+    if db.get_batch(batch_id) is None:
+        raise HTTPException(404, "批不存在")
+    path = settings.ZIP_DIR / f"{batch_id}.zip"
+    if not path.exists():
+        raise HTTPException(404, "ZIP 不存在，无需注入")
+    if mode == "missing":
+        path.unlink()
+        detail = "ZIP 已删除（模拟数据卷丢失归档）"
+    elif mode == "truncate":
+        data = path.read_bytes()
+        path.write_bytes(data[: max(1, len(data) // 3)])
+        detail = "ZIP 已截断（模拟结构损坏）"
+    else:
+        buf = bytearray(path.read_bytes())
+        start = max(0, len(buf) // 3)
+        for i in range(start, min(len(buf), start + 256)):
+            buf[i] ^= 0xFF
+        path.write_bytes(bytes(buf))
+        detail = "ZIP 已位翻转（模拟条目 CRC 损坏）"
+    db.add_event("FAULT_ZIP_CORRUPTED", f"演示故障注入：{detail}", batch_id)
+    return {"detail": detail}
+
+
+@app.post("/internal/fault/remove-slice/{batch_id}", tags=["internal"],
+          summary="（演示用）把一个已登记原片移入隔离区，模拟数据卷缺片")
+def fault_remove_slice(batch_id: str) -> dict:
+    if db.get_batch(batch_id) is None:
+        raise HTTPException(404, "批不存在")
+    files = db.received_files(batch_id)
+    if not files:
+        raise HTTPException(409, "批内没有已登记原片")
+    quarantine = _quarantine_dir(batch_id)
+    quarantine.mkdir(parents=True, exist_ok=True)
+    for sop_uid, file_path in files:
+        src = Path(file_path)
+        if src.is_file():
+            dst = quarantine / src.name
+            os.replace(src, dst)
+            db.add_event(
+                "FAULT_SLICE_REMOVED",
+                f"演示故障注入：原片 {src.name} 已移入隔离区（模拟缺片）",
+                batch_id,
+            )
+            return {"removed_sop": sop_uid, "quarantined_to": str(dst)}
+    raise HTTPException(409, "没有可移除的原片（可能已被移除）")
+
+
+@app.post("/internal/fault/restore-slices/{batch_id}", tags=["internal"],
+          summary="（演示用）把隔离区原片放回登记路径，模拟修复数据卷")
+def fault_restore_slices(batch_id: str) -> dict:
+    if db.get_batch(batch_id) is None:
+        raise HTTPException(404, "批不存在")
+    quarantine = _quarantine_dir(batch_id)
+    registered = {Path(p).name: p for _, p in db.received_files(batch_id)}
+    restored: list[str] = []
+    if quarantine.exists():
+        for item in sorted(quarantine.iterdir()):
+            target = registered.get(item.name)
+            if target is None:
+                continue
+            os.replace(item, target)
+            restored.append(item.name)
+    if restored:
+        db.add_event(
+            "FAULT_SLICE_RESTORED",
+            f"演示故障恢复：{len(restored)} 个原片已放回数据卷",
+            batch_id,
+        )
+    try:
+        quarantine.rmdir()
+    except OSError:
+        pass
+    return {"restored": restored}

@@ -483,6 +483,36 @@ def test_08_concurrent_duplicate_stores_count_once(env_stack):
     assert final["received_count"] == view["expected_count"]
 
 
+def _restart_api(stack):
+    """终止并重启 API 进程（复用会话内端口与数据目录）。"""
+    proc = stack["api_proc"]
+    proc.terminate()
+    proc.wait(timeout=10)
+    restart_log = open(
+        stack["log_dir"] / f"api-restart-{len(stack['spawned'])}.log", "w"
+    )
+    restarted = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app",
+         "--host", "127.0.0.1", "--port", str(stack["http_port"]),
+         "--log-level", "warning"],
+        cwd=ROOT, env=stack["api_env"], start_new_session=True,
+        stdout=restart_log, stderr=subprocess.STDOUT, text=True,
+    )
+    stack["api_proc"] = restarted
+    stack["spawned"].append(restarted)
+    stack["log_handles"].append(restart_log)
+    _wait_http(f"{stack['base']}/health")
+
+
+def _new_completed_batch(stack, study: str) -> dict:
+    r = requests.post(f"{stack['base']}/batches",
+                      json={"study_instance_uid": study}, timeout=10)
+    assert r.status_code == 201, r.text
+    view = _wait_terminal(stack, r.json()["id"])
+    assert view["state"] == "COMPLETED", view
+    return view
+
+
 def test_09_restart_recovery(env_stack):
     # 先确认已有完成批
     batches = requests.get(f"{env_stack['base']}/batches", timeout=5).json()
@@ -515,28 +545,155 @@ def test_09_restart_recovery(env_stack):
     proc.terminate()
     proc.wait(timeout=10)
 
-    restart_log = open(env_stack["log_dir"] / "api-restart.log", "w")
-    restarted = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "app.main:app",
-         "--host", "127.0.0.1", "--port", str(env_stack["http_port"]),
-         "--log-level", "warning"],
-        cwd=ROOT, env=env_stack["api_env"], start_new_session=True,
-        stdout=restart_log, stderr=subprocess.STDOUT, text=True,
-    )
-    env_stack["api_proc"] = restarted
-    env_stack["spawned"].append(restarted)
-    env_stack["log_handles"].append(restart_log)
-    try:
-        _wait_http(f"{env_stack['base']}/health")
-        orphan = requests.get(
-            f"{env_stack['base']}/batches/orphan0001", timeout=5).json()
-        assert orphan["state"] == "FAILED"
-        assert "重启" in orphan["failure_reason"]
+    _restart_api(env_stack)
+    orphan = requests.get(
+        f"{env_stack['base']}/batches/orphan0001", timeout=5).json()
+    assert orphan["state"] == "FAILED"
+    assert "重启" in orphan["failure_reason"]
 
-        # 已完成批仍可下载
-        dl = requests.get(
-            f"{env_stack['base']}/batches/{completed['id']}/download",
-            timeout=20)
-        assert dl.status_code == 200
-    finally:
-        pass
+    # 已完成批仍可下载
+    dl = requests.get(
+        f"{env_stack['base']}/batches/{completed['id']}/download",
+        timeout=20)
+    assert dl.status_code == 200
+
+
+# =============================================================== 归档恢复
+def test_10_corrupt_zip_rebuilt_once_under_concurrent_downloads(env_stack):
+    """损坏包：下载前核对发现异常并重建；8 路并发只重建一次。"""
+    import concurrent.futures
+    import io
+    import zipfile
+
+    studies = _studies(env_stack)
+    view = _new_completed_batch(env_stack, studies[0]["study_instance_uid"])
+    bid = view["id"]
+
+    cr = requests.post(f"{env_stack['base']}/internal/fault/corrupt-zip/{bid}",
+                       params={"mode": "corrupt"}, timeout=5)
+    assert cr.status_code == 200
+
+    def _dl(_):
+        resp = requests.get(f"{env_stack['base']}/batches/{bid}/download",
+                            timeout=30)
+        return resp.status_code, resp.content
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(_dl, range(8)))
+
+    assert all(code == 200 for code, _ in results), results
+    payloads = {content for _, content in results}
+    assert len(payloads) == 1, "并发下载必须拿到同一份完整包"
+    zf = zipfile.ZipFile(io.BytesIO(results[0][1]))
+    assert zf.testzip() is None
+    dcm = [n for n in zf.namelist() if n.startswith("dicom/")]
+    assert len(dcm) == view["expected_count"]
+
+    events = requests.get(f"{env_stack['base']}/batches/{bid}/events",
+                          timeout=5).json()
+    kinds = [e["kind"] for e in events]
+    assert kinds.count("ZIP_REBUILT") == 1, kinds  # 并发只重建一次
+    assert kinds.count("ZIP_INVALID") == 1
+    # 无临时包残留
+    assert not list((env_stack["api_data"] / "zips").glob("*.part"))
+
+
+def test_11_missing_slice_blocks_download_then_recovers(env_stack):
+    """缺片：保留完成记录、不可下载并给出原因；修复数据卷后恢复。"""
+    import io
+    import zipfile
+
+    studies = _studies(env_stack)
+    view = _new_completed_batch(env_stack, studies[1]["study_instance_uid"])
+    bid = view["id"]
+
+    rm = requests.post(
+        f"{env_stack['base']}/internal/fault/remove-slice/{bid}", timeout=5)
+    assert rm.status_code == 200
+    requests.post(f"{env_stack['base']}/internal/fault/corrupt-zip/{bid}",
+                  params={"mode": "missing"}, timeout=5)
+
+    resp = requests.get(f"{env_stack['base']}/batches/{bid}/download",
+                        timeout=10)
+    assert resp.status_code == 409  # 不返回残缺 ZIP
+    assert "原片缺失" in resp.json()["detail"]
+
+    view = requests.get(f"{env_stack['base']}/batches/{bid}",
+                        timeout=5).json()
+    assert view["state"] == "COMPLETED"  # 完成记录保留
+    assert view["downloadable"] is False
+    assert "原片缺失" in view["download_blocked_reason"]
+
+    # 修复数据卷后再次请求即可恢复
+    rs = requests.post(
+        f"{env_stack['base']}/internal/fault/restore-slices/{bid}", timeout=5)
+    assert rs.status_code == 200 and rs.json()["restored"]
+    resp2 = requests.get(f"{env_stack['base']}/batches/{bid}/download",
+                         timeout=20)
+    assert resp2.status_code == 200
+    zf = zipfile.ZipFile(io.BytesIO(resp2.content))
+    assert zf.testzip() is None
+    assert len([n for n in zf.namelist()
+                if n.startswith("dicom/")]) == view["expected_count"]
+    view2 = requests.get(f"{env_stack['base']}/batches/{bid}",
+                         timeout=5).json()
+    assert view2["downloadable"] is True
+    assert view2["download_blocked_reason"] is None
+
+
+def test_12_startup_verify_rebuilds_and_sweeps_stale_tmp(env_stack):
+    """重启核对：截断的 ZIP 在启动时重建；残留临时包被清扫。"""
+    studies = _studies(env_stack)
+    view = _new_completed_batch(env_stack, studies[2]["study_instance_uid"])
+    bid = view["id"]
+
+    requests.post(f"{env_stack['base']}/internal/fault/corrupt-zip/{bid}",
+                  params={"mode": "truncate"}, timeout=5)
+    stale = env_stack["api_data"] / "zips" / f"{bid}.deadbeef.part"
+    stale.write_bytes(b"residue from a crashed rebuild")
+
+    _restart_api(env_stack)
+
+    assert not stale.exists(), "启动时应清扫残留临时包"
+    resp = requests.get(f"{env_stack['base']}/batches/{bid}/download",
+                        timeout=20)
+    assert resp.status_code == 200
+    events = requests.get(f"{env_stack['base']}/batches/{bid}/events",
+                          timeout=5).json()
+    rebuilt = [e for e in events
+               if e["kind"] == "ZIP_REBUILT" and "启动核对" in e["message"]]
+    assert rebuilt, [e["kind"] for e in events]
+
+
+def test_13_startup_keeps_completed_but_blocks_unrebuildable(env_stack):
+    """重启核对：缺片且 ZIP 丢失时保留完成记录、标记原因；修复后恢复。"""
+    studies = _studies(env_stack)
+    view = _new_completed_batch(env_stack, studies[0]["study_instance_uid"])
+    bid = view["id"]
+
+    requests.post(f"{env_stack['base']}/internal/fault/remove-slice/{bid}",
+                  timeout=5)
+    requests.post(f"{env_stack['base']}/internal/fault/corrupt-zip/{bid}",
+                  params={"mode": "missing"}, timeout=5)
+
+    _restart_api(env_stack)
+
+    view = requests.get(f"{env_stack['base']}/batches/{bid}",
+                        timeout=5).json()
+    assert view["state"] == "COMPLETED"  # 不被改判 FAILED
+    assert view["downloadable"] is False
+    assert "原片缺失" in view["download_blocked_reason"]
+    resp = requests.get(f"{env_stack['base']}/batches/{bid}/download",
+                        timeout=10)
+    assert resp.status_code == 409
+
+    # 修复数据卷后再次请求可恢复
+    requests.post(f"{env_stack['base']}/internal/fault/restore-slices/{bid}",
+                  timeout=5)
+    resp2 = requests.get(f"{env_stack['base']}/batches/{bid}/download",
+                         timeout=20)
+    assert resp2.status_code == 200
+    view2 = requests.get(f"{env_stack['base']}/batches/{bid}",
+                         timeout=5).json()
+    assert view2["downloadable"] is True
+    assert view2["download_blocked_reason"] is None

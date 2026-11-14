@@ -1,9 +1,11 @@
-"""文件落盘、DICOM 校验、故障注入与 ZIP 打包。"""
+"""文件落盘、DICOM 校验与故障注入。
+
+ZIP 归档的核对/重建/原子替换见 :mod:`app.archive`。
+"""
 from __future__ import annotations
 
 import logging
 import os
-import zipfile
 from pathlib import Path
 
 import pydicom
@@ -96,7 +98,7 @@ def write_dataset(batch_id: str, ds: pydicom.Dataset, ts: str) -> Path:
         with open(tmp, "rb") as fh:
             os.fsync(fh.fileno())
         os.replace(tmp, final)
-        _fsync_dir(d)
+        fsync_dir(d)
         return final
     except (OSError, PermissionError) as exc:
         for p in (tmp, final):
@@ -107,7 +109,7 @@ def write_dataset(batch_id: str, ds: pydicom.Dataset, ts: str) -> Path:
         raise StorageError(f"文件写入失败：{exc}") from exc
 
 
-def _fsync_dir(d: Path) -> None:
+def fsync_dir(d: Path) -> None:
     try:
         fd = os.open(str(d), os.O_RDONLY)
         try:
@@ -116,29 +118,3 @@ def _fsync_dir(d: Path) -> None:
             os.close(fd)
     except OSError:
         pass
-
-
-def build_zip(batch_id: str) -> Path:
-    """把已登记实例打包为 ZIP；只打包清单内且已登记的文件。"""
-    from .db import get_db  # 局部导入避免循环依赖
-
-    db = get_db()
-    zip_path = settings.ZIP_DIR / f"{batch_id}.zip"
-    tmp_zip = settings.ZIP_DIR / f"{batch_id}.zip.part"
-    files = db.received_files(batch_id)
-    with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-        manifest_lines = ["sop_instance_uid,file_name"]
-        used_names: set[str] = set()
-        for sop_uid, file_path in files:
-            src = Path(file_path)
-            name = src.name
-            # 极端重名兜底
-            if name in used_names:
-                name = f"{sop_uid.replace('.', '_')}.dcm"
-            used_names.add(name)
-            zf.write(src, arcname=f"dicom/{name}")
-            manifest_lines.append(f"{sop_uid},{name}")
-        zf.writestr("MANIFEST.csv", "\n".join(manifest_lines) + "\n")
-    os.replace(tmp_zip, zip_path)
-    _fsync_dir(settings.ZIP_DIR)
-    return zip_path

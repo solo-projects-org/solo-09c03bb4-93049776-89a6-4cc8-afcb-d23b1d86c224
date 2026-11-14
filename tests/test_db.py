@@ -115,3 +115,59 @@ def test_events_recorded(db):
     db.fail_batch("b1", "x")
     kinds = [e["kind"] for e in db.list_events("b1")]
     assert kinds == ["BATCH_CREATED", "BATCH_FAILED"]
+
+
+def test_download_blocked_flag_roundtrip(db):
+    db.create_batch("b1", "1.2.840.66.1", "")
+    db.transition_state("b1", [STATE_PENDING], STATE_FINDING)
+    db.set_manifest("b1", _manifest(1))
+    db.transition_state("b1", [STATE_FINDING], STATE_MOVING)
+    db.register_instance("b1", "1.2.3.0", "/f", TS)
+    db.complete_batch("b1", "/z.zip")
+
+    assert db.get_batch("b1")["download_blocked_reason"] is None
+    db.set_download_blocked("b1", "原片缺失：1 个已登记 DICOM 不在数据卷")
+    row = db.get_batch("b1")
+    assert row["state"] == STATE_COMPLETED  # 完成记录保留
+    assert "原片缺失" in row["download_blocked_reason"]
+    db.clear_download_blocked("b1")
+    assert db.get_batch("b1")["download_blocked_reason"] is None
+    # 重复清除是安全的
+    db.clear_download_blocked("b1")
+
+
+def test_migrate_adds_download_blocked_column(tmp_path):
+    """老库（无 download_blocked_reason 列）打开后应自动补列。"""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE batches (
+            id TEXT PRIMARY KEY,
+            study_instance_uid TEXT NOT NULL,
+            state TEXT NOT NULL,
+            expected_count INTEGER NOT NULL DEFAULT 0,
+            received_count INTEGER NOT NULL DEFAULT 0,
+            failure_reason TEXT,
+            zip_path TEXT,
+            fault_inject TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO batches(id, study_instance_uid, state, created_at,
+                            updated_at)
+        VALUES ('legacy', '1.2.3', 'COMPLETED', 't', 't');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    row = db.get_batch("legacy")
+    assert row["state"] == STATE_COMPLETED
+    assert row["download_blocked_reason"] is None
+    db.set_download_blocked("legacy", "迁移后可写")
+    assert db.get_batch("legacy")["download_blocked_reason"] == "迁移后可写"
+    db.close()

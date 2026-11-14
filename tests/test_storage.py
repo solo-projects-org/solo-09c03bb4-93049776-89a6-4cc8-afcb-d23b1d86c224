@@ -1,11 +1,8 @@
-"""storage 层：非压缩 CT 校验、落盘、ZIP 打包与保存故障。"""
+"""storage 层：非压缩 CT 校验、落盘与保存故障（ZIP 归档见 test_archive.py）。"""
 from __future__ import annotations
-
-import zipfile
 
 import pytest
 from pydicom.uid import (
-    CTImageStorage,
     ExplicitVRLittleEndian,
     ImplicitVRLittleEndian,
     JPEGBaseline8Bit,
@@ -57,29 +54,20 @@ def test_validate_rejects_compressed_and_non_ct(workspace):
         storage.validate_dataset(ds2, ts2)
 
 
-def test_write_and_zip_only_contains_registered(workspace):
+def test_write_dataset_atomic_and_registered(workspace):
     data, db = workspace
     db.create_batch("b1", "1.2.3.9", "")
     db.transition_state("b1", ["PENDING"], "FINDING")
     db.set_manifest("b1", [
-        ("1.2.3.4", str(CTImageStorage), str(ExplicitVRLittleEndian)),
-        ("1.2.3.5", str(CTImageStorage), str(ExplicitVRLittleEndian)),
+        ("1.2.3.4", "1.2.840.10008.5.1.4.1.1.2", str(ExplicitVRLittleEndian)),
     ])
     db.transition_state("b1", ["FINDING"], "MOVING")
 
-    for sop in ("1.2.3.4", "1.2.3.5"):
-        ds, ts = _ds(sop=sop)
-        path = storage.write_dataset("b1", ds, ts)
-        assert path.exists()
-        assert db.register_instance("b1", sop, str(path), ts)
-
-    zip_path = storage.build_zip("b1")
-    with zipfile.ZipFile(zip_path) as zf:
-        dicom_files = [n for n in zf.namelist() if n.startswith("dicom/")]
-        assert len(dicom_files) == 2
-        assert "MANIFEST.csv" in zf.namelist()
-        manifest = zf.read("MANIFEST.csv").decode().splitlines()
-        assert len(manifest) == 3  # 表头 + 2 行
+    ds, ts = _ds()
+    path = storage.write_dataset("b1", ds, ts)
+    assert path.exists()
+    assert not list((data / "batches" / "b1").glob("*.part"))
+    assert db.register_instance("b1", "1.2.3.4", str(path), ts)
 
 
 def test_write_failure_on_readonly_dir(workspace):

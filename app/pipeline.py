@@ -5,8 +5,8 @@ import logging
 import threading
 
 from . import dicom, storage
+from .archive import ArchiveError, ArchiveService, sweep_stale_tempfiles
 from .db import (
-    STATE_COMPLETED,
     STATE_FAILED,
     STATE_FINDING,
     STATE_MOVING,
@@ -18,8 +18,9 @@ log = logging.getLogger("pipeline")
 
 
 class Pipeline:
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, archive: ArchiveService) -> None:
         self.db = db
+        self.archive = archive
         self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
 
@@ -121,8 +122,8 @@ class Pipeline:
             return
 
         try:
-            zip_path = storage.build_zip(batch_id)
-        except Exception as exc:
+            zip_path = self.archive.build_package(batch_id)
+        except ArchiveError as exc:
             db.fail_batch(batch_id, f"ZIP 打包失败：{exc}")
             log.exception("批 %s ZIP 打包失败", batch_id)
             storage.restore_batch_writable(batch_id)
@@ -137,8 +138,16 @@ class Pipeline:
 
 
 # ---------------------------------------------------------------- recovery
-def recover_on_startup(db: Database) -> None:
-    """重启恢复：未完成批一律失败；完成批缺失 ZIP 则补建。"""
+def recover_on_startup(db: Database, archive: ArchiveService) -> None:
+    """重启恢复：未完成批一律失败；完成批核对 ZIP，异常即从登记原片重建。
+
+    * 重启时先清扫上次崩溃可能残留的 ``*.part`` 临时包（临时包从不对外可见）。
+    * 完成批的归档核对/重建失败**不改变** COMPLETED 终态，只记录
+      ``download_blocked_reason``；数据卷修复后下载请求会自动重试，
+      其他批的取数与下载不受影响。
+    """
+    sweep_stale_tempfiles()
+
     for batch in db.non_terminal_batches():
         db.fail_batch(
             batch["id"],
@@ -147,17 +156,11 @@ def recover_on_startup(db: Database) -> None:
         storage.restore_batch_writable(batch["id"])
 
     for batch in db.all_completed_batches():
-        zip_path = storage.settings.ZIP_DIR / f"{batch['id']}.zip"
-        if not zip_path.exists():
-            try:
-                rebuilt = storage.build_zip(batch["id"])
-                db.transition_state(
-                    batch["id"], [STATE_COMPLETED], STATE_COMPLETED,
-                    zip_path=str(rebuilt),
-                )
-                db.add_event("ZIP_REBUILT", "重启后重建 ZIP", batch["id"])
-            except Exception as exc:  # 数据卷损坏等
-                db.transition_state(
-                    batch["id"], [STATE_COMPLETED], STATE_FAILED,
-                    failure_reason=f"重启后 ZIP 重建失败：{exc}",
-                )
+        try:
+            archive.ensure_package(batch["id"], trigger="启动核对")
+        except ArchiveError as exc:
+            # 保留完成记录，仅标记不可下载及原因；修复数据卷后可恢复
+            log.warning("批 %s 启动核对后归档不可用：%s", batch["id"], exc)
+        except Exception:
+            # 单批异常不得影响其他批的恢复
+            log.exception("批 %s 启动核对出现意外异常", batch["id"])

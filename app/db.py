@@ -65,16 +65,17 @@ class Database:
             self._conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS batches (
-                    id                  TEXT PRIMARY KEY,
-                    study_instance_uid  TEXT NOT NULL,
-                    state               TEXT NOT NULL,
-                    expected_count      INTEGER NOT NULL DEFAULT 0,
-                    received_count      INTEGER NOT NULL DEFAULT 0,
-                    failure_reason      TEXT,
-                    zip_path            TEXT,
-                    fault_inject        TEXT NOT NULL DEFAULT '',
-                    created_at          TEXT NOT NULL,
-                    updated_at          TEXT NOT NULL
+                    id                      TEXT PRIMARY KEY,
+                    study_instance_uid      TEXT NOT NULL,
+                    state                   TEXT NOT NULL,
+                    expected_count          INTEGER NOT NULL DEFAULT 0,
+                    received_count          INTEGER NOT NULL DEFAULT 0,
+                    failure_reason          TEXT,
+                    zip_path                TEXT,
+                    download_blocked_reason TEXT,
+                    fault_inject            TEXT NOT NULL DEFAULT '',
+                    created_at              TEXT NOT NULL,
+                    updated_at              TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_batches_study
                     ON batches(study_instance_uid);
@@ -101,6 +102,19 @@ class Database:
                     ON events(batch_id, id);
                 """
             )
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """对既有数据卷做增量列迁移（老库无 download_blocked_reason）。"""
+        with self._lock, self._conn:
+            cols = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(batches)")
+            }
+            if "download_blocked_reason" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE batches ADD COLUMN download_blocked_reason TEXT"
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -217,6 +231,29 @@ class Database:
         if ok:
             self.add_event("BATCH_COMPLETED", "清单收齐，ZIP 已生成", batch_id)
         return ok
+
+    # ------------------------------------------------------------------ 下载可用性
+    def set_download_blocked(self, batch_id: str, reason: str) -> None:
+        """标记完成批暂不可下载（保留 COMPLETED 记录，仅给出具体原因）。
+
+        这不是状态迁移：批仍是 COMPLETED，数据卷修复后下一次下载
+        请求会重试重建并在成功时清除该标记。
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE batches SET download_blocked_reason = ?, updated_at = ? "
+                "WHERE id = ?",
+                (reason, _now(), batch_id),
+            )
+
+    def clear_download_blocked(self, batch_id: str) -> None:
+        """归档恢复有效后清除不可下载标记。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE batches SET download_blocked_reason = NULL "
+                "WHERE id = ? AND download_blocked_reason IS NOT NULL",
+                (batch_id,),
+            )
 
     # ------------------------------------------------------------------ manifest
     def set_manifest(
